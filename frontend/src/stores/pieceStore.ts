@@ -18,6 +18,7 @@ import {
   removePiece,
   removeStep,
   reorderSteps,
+  retryGatherStep,
   syncPieceState,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
@@ -193,10 +194,30 @@ export const usePieceStore = defineStore('piece', () => {
 
   /* ------------------------------ 工序 ------------------------------ */
 
-  async function createStep(draft: StepDraft): Promise<Step> {
-    const stamp = nowIso()
-    const row: Step = {
-      id: uuid('step'),
+  /** 把表单草稿映射为工序行；非取料道次清空取料字段，取料道次先落「待记账」等熔化工对账 */
+  function buildStepFromDraft(draft: StepDraft, stamp: string, id: string): Step {
+    if (draft.name !== '取料') {
+      return {
+        id,
+        pieceId: draft.pieceId,
+        seq: draft.seq,
+        name: draft.name,
+        tempC: draft.tempC,
+        durationMin: draft.durationMin,
+        operator: draft.operator.trim(),
+        remark: draft.remark.trim(),
+        state: draft.state,
+        gatherKg: 0,
+        gatherBatchId: '',
+        gatherAt: '',
+        gatherState: '',
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      }
+    }
+    return {
+      id,
       pieceId: draft.pieceId,
       seq: draft.seq,
       name: draft.name,
@@ -205,10 +226,20 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      gatherKg: draft.gatherKg,
+      gatherBatchId: draft.gatherBatchId,
+      gatherAt: draft.gatherAt || stamp,
+      // 技师这笔先挂「待记账」：熔化工按取料先后对账，过账后才扣余量
+      gatherState: '待记账',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
+  }
+
+  async function createStep(draft: StepDraft): Promise<Step> {
+    const stamp = nowIso()
+    const row = buildStepFromDraft(draft, stamp, uuid('step'))
     await putStep(row)
     revision.value += 1
     return row
@@ -217,6 +248,27 @@ export const usePieceStore = defineStore('piece', () => {
   async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
+    const stamp = nowIso()
+    if (draft.name !== '取料') {
+      await putStep({
+        ...existing,
+        seq: draft.seq,
+        name: draft.name,
+        tempC: draft.tempC,
+        durationMin: draft.durationMin,
+        operator: draft.operator.trim(),
+        remark: draft.remark.trim(),
+        state: draft.state,
+        gatherKg: 0,
+        gatherBatchId: '',
+        gatherAt: '',
+        gatherState: '',
+      })
+      revision.value += 1
+      return
+    }
+    // 已记账的取料量 / 批次 / 时间是熔化工那本账的扣减凭据：保持不可变，只允许改登记信息
+    const wasPosted = existing.gatherState === '已记账'
     await putStep({
       ...existing,
       seq: draft.seq,
@@ -226,8 +278,43 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      gatherKg: wasPosted ? existing.gatherKg : draft.gatherKg,
+      gatherBatchId: wasPosted ? existing.gatherBatchId : draft.gatherBatchId,
+      gatherAt: wasPosted ? existing.gatherAt : draft.gatherAt || stamp,
+      // 未过账的编辑（待记账 / 待重交）保持原对账状态，由页面决定是否重新提交
+      gatherState: wasPosted ? '已记账' : existing.gatherState === '' ? '待记账' : existing.gatherState,
     })
     revision.value += 1
+  }
+
+  /**
+   * 技师提交单笔取料与熔化工批次台账对账：
+   * 余量够 → 过账「已记账」并扣余量；余量不够 → 只退回这笔「待重交」，熔化工余量不回倒。
+   * 返回结果供页面给出成功 / 失败提示。
+   */
+  async function submitGather(stepId: string): Promise<boolean> {
+    const ok = await retryGatherStep(stepId)
+    revision.value += 1
+    const step = steps.value.find((row) => row.id === stepId)
+    if (step !== undefined) {
+      lastMessage.value = ok
+        ? `第 ${step.seq} 道取料 ${step.gatherKg} kg 已提交记账，批次余量已扣减`
+        : `第 ${step.seq} 道取料 ${step.gatherKg} kg 提交失败：批次余量不足，这笔先留着等重交，熔化工余量不回倒`
+    }
+    return ok
+  }
+
+  /** 「待重交」的取料补料后重交：余量够则过账，不够继续保留 */
+  async function retryGather(stepId: string): Promise<boolean> {
+    const ok = await retryGatherStep(stepId)
+    revision.value += 1
+    const step = steps.value.find((row) => row.id === stepId)
+    if (step !== undefined) {
+      lastMessage.value = ok
+        ? `第 ${step.seq} 道取料已重交过账，批次余量已扣减`
+        : `批次余量仍不足，第 ${step.seq} 道取料继续保留「待重交」等补料`
+    }
+    return ok
   }
 
   async function deleteStep(stepId: string): Promise<void> {
@@ -320,6 +407,8 @@ export const usePieceStore = defineStore('piece', () => {
     createStep,
     updateStep,
     deleteStep,
+    submitGather,
+    retryGather,
     advanceStep,
     moveStepBefore,
     moveStepToIndex,

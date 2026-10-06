@@ -13,9 +13,18 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import {
+  GATHER_STATE_META,
+  STEP_NAME_OPTIONS,
+  STEP_STATE_OPTIONS,
+  type Step,
+  type StepDraft,
+  type StepName,
+  type StepState,
+} from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
+import { nowLocalInput } from '@/utils/id'
 
 const route = useRoute()
 const router = useRouter()
@@ -42,16 +51,27 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  gatherKg: 5,
+  gatherBatchId: '',
+  gatherAt: nowLocalInput(),
 })
 
-const rules: FormRules<StepDraft> = {
+const rules = computed<FormRules<StepDraft>>(() => ({
   seq: [{ required: true, message: '请填写工序序号', trigger: 'blur' }],
   name: [{ required: true, message: '请选择工序名称', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写工序温度', trigger: 'blur' }],
   durationMin: [{ required: true, message: '请填写时长', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择工序状态', trigger: 'change' }],
-}
+  gatherKg:
+    form.name === '取料' ? [{ required: true, message: '请填写取料量', trigger: 'blur' }] : [],
+  gatherBatchId:
+    form.name === '取料' ? [{ required: true, message: '请选择取料批次（料液归属）', trigger: 'change' }] : [],
+  gatherAt:
+    form.name === '取料' ? [{ required: true, message: '请选择取料时间（对账排队依据）', trigger: 'change' }] : [],
+}))
+
+const isGatherForm = computed<boolean>(() => form.name === '取料')
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
 
@@ -78,15 +98,20 @@ onMounted(() => {
 function openCreate(): void {
   editingId.value = null
   const nextSeq = steps.value.length + 1
+  const nextName = (STEP_NAME_OPTIONS[Math.min(nextSeq - 1, STEP_NAME_OPTIONS.length - 1)] ?? '取料') as StepName
   Object.assign(form, {
     pieceId: pieceId.value,
     seq: nextSeq,
-    name: (STEP_NAME_OPTIONS[Math.min(nextSeq - 1, STEP_NAME_OPTIONS.length - 1)] ?? '取料') as StepName,
+    name: nextName,
     tempC: currentStep.value?.tempC ?? 1150,
     durationMin: 5,
-    operator: currentStep.value?.operator ?? '',
+    operator: currentStep.value?.operator ?? piece.value?.artist ?? '',
     remark: '',
     state: '未开始' as StepState,
+    gatherKg: 5,
+    // 新取料道次默认归属作品登记的料液批次
+    gatherBatchId: piece.value?.batchId ?? '',
+    gatherAt: nowLocalInput(),
   })
   dialogVisible.value = true
 }
@@ -102,9 +127,18 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    gatherKg: row.gatherKg || 5,
+    gatherBatchId: row.gatherBatchId || piece.value?.batchId || '',
+    gatherAt: row.gatherAt || nowLocalInput(),
   })
   dialogVisible.value = true
 }
+
+/** 正在编辑的取料道次是否已记账（已记账的取料量是熔化工扣减凭据，禁止改量 / 删除） */
+const editingPostedGather = computed<boolean>(() => {
+  if (form.name !== '取料' || editingId.value === null) return false
+  return steps.value.find((row) => row.id === editingId.value)?.gatherState === '已记账'
+})
 
 async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
@@ -115,20 +149,39 @@ async function handleSubmit(): Promise<void> {
   }
   submitting.value = true
   try {
+    let saved: Step | null = null
+    let savedPosted = false
     if (editingId.value === null) {
-      await pieceStore.createStep({ ...form })
+      saved = await pieceStore.createStep({ ...form })
       ElMessage.success(`已新增第 ${form.seq} 道「${form.name}」`)
     } else {
+      savedPosted = steps.value.find((row) => row.id === editingId.value)?.gatherState === '已记账'
       await pieceStore.updateStep(editingId.value, { ...form })
+      saved = pieceStore.steps.find((row) => row.id === editingId.value) ?? null
       ElMessage.success('工序已更新')
     }
     dialogVisible.value = false
+    // 取料道次：新建（或编辑非已记账）时技师账落账后立即与熔化工余量账对账；
+    // 已记账的取料是扣减凭据，编辑不改取料量，不重复对账
+    if (form.name === '取料' && saved !== null && !savedPosted) {
+      const ok = await pieceStore.submitGather(saved.id)
+      if (ok) {
+        ElMessage.success(`取料 ${form.gatherKg} kg 已记账，批次余量按取料先后扣减`)
+      } else {
+        ElMessage.error(`批次余量不足：这笔取料保留「待重交」等补料，熔化工余量不回倒；已过账的前几笔照旧`)
+      }
+    }
   } finally {
     submitting.value = false
   }
 }
 
 async function handleDelete(row: Step): Promise<void> {
+  // 已记账取料是熔化工那本账的扣减凭据，删除会让两本账对不上
+  if (row.name === '取料' && row.gatherState === '已记账') {
+    ElMessage.warning('该取料道次已记账（熔化工余量已扣减），不能删除；如需更正请先由熔化工补料后改记')
+    return
+  }
   try {
     await ElMessageBox.confirm(`确认删除第 ${row.seq} 道「${row.name}」？`, '删除确认', {
       type: 'warning',
@@ -139,7 +192,18 @@ async function handleDelete(row: Step): Promise<void> {
     return
   }
   await pieceStore.deleteStep(row.id)
-  ElMessage.success('工序已删除')
+  ElMessage.success('工序已删除，作品状态已重新推导')
+}
+
+/** 待重交的取料道次在熔化工补料后重交：余量够则过账，不够继续保留 */
+async function handleRetryGather(row: Step): Promise<void> {
+  const ok = await pieceStore.retryGather(row.id)
+  ElMessage[ok ? 'success' : 'error'](pieceStore.lastMessage)
+}
+
+/** 取料归属批次的当前余量，供列表 / 表单提示 */
+function remainOfBatch(batchId: string): number | undefined {
+  return furnaceStore.batches.find((row) => row.id === batchId)?.remainKg
 }
 
 async function handleAdvance(row: Step): Promise<void> {
@@ -291,11 +355,33 @@ function goAnnealing(): void {
                 >
                   {{ row.state }}
                 </el-tag>
+                <el-tag
+                  v-if="row.name === '取料' && row.gatherState !== ''"
+                  size="small"
+                  :type="GATHER_STATE_META[row.gatherState as '待记账' | '已记账' | '待重交'].tone"
+                  effect="dark"
+                >
+                  取料账：{{ GATHER_STATE_META[row.gatherState as '待记账' | '已记账' | '待重交'].label }}
+                </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
+              </div>
+              <div v-if="row.name === '取料'" class="step-gather">
+                取料量 <b>{{ row.gatherKg }} kg</b>
+                · 归属 {{ furnaceStore.batches.find((item) => item.id === row.gatherBatchId)?.colorCode ?? '（批次已删除）' }}
+                · 取料于 {{ row.gatherAt.replace('T', ' ') }}
+                <template v-if="row.gatherState === '已记账'">
+                  · 该批次余量已扣，账已对上
+                </template>
+                <template v-else-if="row.gatherState === '待重交'">
+                  · 轮到这笔时该批次余量不足，仅退回本件
+                </template>
+                <template v-else>
+                  · 当前批次剩余 {{ remainOfBatch(row.gatherBatchId) ?? '—' }} kg，待熔化工对账
+                </template>
               </div>
             </div>
             <div class="step-actions">
@@ -308,8 +394,24 @@ function goAnnealing(): void {
               >
                 推进状态
               </el-button>
+              <el-button
+                v-if="row.name === '取料' && (row.gatherState === '待重交' || row.gatherState === '待记账')"
+                size="small"
+                type="warning"
+                @click="handleRetryGather(row)"
+              >
+                {{ row.gatherState === '待重交' ? '重交取料' : '提交记账' }}
+              </el-button>
               <el-button size="small" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
+              <el-button
+                size="small"
+                type="danger"
+                plain
+                :disabled="row.name === '取料' && row.gatherState === '已记账'"
+                @click="handleDelete(row)"
+              >
+                删除
+              </el-button>
             </div>
           </li>
         </ul>
@@ -359,6 +461,76 @@ function goAnnealing(): void {
         <el-form-item label="备注">
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="如：分三次吹气成型 / 夹持颈部收细" />
         </el-form-item>
+
+        <template v-if="isGatherForm">
+          <el-divider content-position="left">取料记账（技师这本账）</el-divider>
+          <el-row :gutter="12">
+            <el-col :span="8">
+              <el-form-item label="取料量（kg）" prop="gatherKg">
+                <el-input-number
+                  v-model="form.gatherKg"
+                  :min="0.1"
+                  :max="500"
+                  :step="0.1"
+                  :precision="1"
+                  :disabled="editingPostedGather"
+                  style="width: 100%"
+                />
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="料液批次" prop="gatherBatchId">
+                <el-select
+                  v-model="form.gatherBatchId"
+                  style="width: 100%"
+                  :disabled="editingPostedGather"
+                  placeholder="选择熔化工批次"
+                >
+                  <el-option
+                    v-for="item in furnaceStore.batches"
+                    :key="item.id"
+                    :value="item.id"
+                    :label="`${item.colorCode} · 余 ${item.remainKg} kg`"
+                  />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="8">
+              <el-form-item label="取料时间" prop="gatherAt">
+                <el-date-picker
+                  v-model="form.gatherAt"
+                  type="datetime"
+                  value-format="YYYY-MM-DDTHH:mm"
+                  format="YYYY-MM-DD HH:mm"
+                  :disabled="editingPostedGather"
+                  style="width: 100%"
+                />
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-alert
+            v-if="editingPostedGather"
+            type="warning"
+            show-icon
+            :closable="false"
+            title="该取料道次已记账：熔化工批次余量已按这笔扣减，取料量与批次不能直接修改。"
+            description="可调整温度、时长、操作人与备注；若确需更正取料量，请由熔化工补料后删除本道次重新登记。"
+            class="mb-12"
+          />
+          <el-alert
+            v-else
+            type="info"
+            show-icon
+            :closable="false"
+            :title="
+              form.gatherBatchId === ''
+                ? '取料量记在作品道次上，保存后按取料先后与熔化工批次余量对账。'
+                : `归属批次当前剩余 ${remainOfBatch(form.gatherBatchId) ?? '—'} kg；保存即提交对账，轮到本件余量不足时只退回这一件（待重交），已扣余量不回倒。`
+            "
+            class="mb-12"
+          />
+        </template>
+
         <el-alert
           :type="tempCheck.ok ? 'success' : 'warning'"
           show-icon
@@ -467,6 +639,16 @@ function goAnnealing(): void {
   color: #8b95a1;
 }
 
+.step-gather {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #6b5a47;
+}
+
+.step-gather b {
+  color: #c2571a;
+}
+
 .step-actions {
   display: flex;
   align-items: center;
@@ -480,5 +662,9 @@ function goAnnealing(): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
 }
 </style>

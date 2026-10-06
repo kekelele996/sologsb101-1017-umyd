@@ -9,9 +9,10 @@ import Dexie, { type Table } from 'dexie'
 import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
-import type { Step } from '../types/step'
+import type { GatherState, Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import { DEFAULT_HISTORY_GATHER_KG } from '../types/step'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
 
@@ -19,10 +20,21 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
+
+/** kg 运算保留 1 位小数，避免 0.1 累计误差影响余量比较 */
+function roundKg(value: number): number {
+  return Math.round(value * 10) / 10
+}
+
+/** 比较余量时容忍的浮点误差（kg） */
+const KG_EPSILON = 1e-6
+
+/** 取料道次的对账状态中，仍在熔化工对账队列里的两种状态 */
+const PENDING_GATHER_STATES: GatherState[] = ['待记账', '待重交']
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +58,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -68,7 +80,7 @@ class GlassBlowDatabase extends Dexie {
         ]
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION
+            row.revision = 2
             if (typeof row.createdAt !== 'string') row.createdAt = nowIso()
             if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt
           })
@@ -91,6 +103,62 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：取料量与操作人记到作品的取料道次上，余量仍归批次台账 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        // 取料道次新增批次归属与对账状态索引，供熔化工按批次过账
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name, gatherBatchId, gatherState',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 1：全部行补齐 v3 修订号
+        const tables = [
+          tx.table('furnaces'),
+          tx.table('batches'),
+          tx.table('pieces'),
+          tx.table('steps'),
+          tx.table('anneals'),
+          tx.table('inspects'),
+        ]
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION
+          })
+        }
+        // 迁移 2：历史作品 → 取料道次的批次归属映射（道次按归属迁移，缺归属的作品留空串）
+        const pieceRows = (await tx.table('pieces').toArray()) as Array<{ id?: unknown; batchId?: unknown }>
+        const batchIdByPiece = new Map<string, string>(
+          pieceRows.map((row) => [String(row.id), typeof row.batchId === 'string' ? row.batchId : '']),
+        )
+        // 迁移 3：旧数据没记取料量的道次按归属迁移，技师那份补历史默认；历史取料一律视为已记账
+        await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.name !== '取料') {
+            row.gatherKg = 0
+            row.gatherBatchId = ''
+            row.gatherAt = ''
+            row.gatherState = ''
+            return
+          }
+          row.gatherBatchId =
+            typeof row.gatherBatchId === 'string' && row.gatherBatchId !== ''
+              ? row.gatherBatchId
+              : batchIdByPiece.get(String(row.pieceId)) ?? ''
+          // 旧数据没记取料量：技师那份补历史默认值
+          if (typeof row.gatherKg !== 'number' || !Number.isFinite(row.gatherKg) || row.gatherKg <= 0) {
+            row.gatherKg = DEFAULT_HISTORY_GATHER_KG
+          }
+          if (typeof row.gatherAt !== 'string' || row.gatherAt === '') {
+            row.gatherAt = typeof row.createdAt === 'string' ? row.createdAt : nowIso()
+          }
+          // 历史取料已经发生过，统一视为熔化工那本账已扣过，避免升级后重复扣余量
+          row.gatherState = '已记账'
         })
       })
   }
@@ -153,13 +221,98 @@ export async function removeBatch(id: string): Promise<void> {
   await db.batches.delete(id)
 }
 
-/** 取料：按剩余量扣减（不足时扣到 0 并返回实际扣减量） */
-export async function consumeBatch(batchId: string, kg: number): Promise<number> {
-  const batch = await db.batches.get(batchId)
-  if (!batch) return 0
-  const actual = Math.max(0, Math.min(batch.remainKg, kg))
-  await db.batches.update(batchId, { remainKg: Math.round((batch.remainKg - actual) * 10) / 10, updatedAt: nowIso() })
-  return actual
+/** 按归属补齐取料道次的记账字段（导入旧版存档时同样适用），非取料道次清空取料字段 */
+export function normalizeStep(row: Step): Step {
+  if (row.name !== '取料') {
+    return { ...row, gatherKg: 0, gatherBatchId: '', gatherAt: '', gatherState: '' }
+  }
+  return {
+    ...row,
+    gatherKg: typeof row.gatherKg === 'number' && Number.isFinite(row.gatherKg) && row.gatherKg > 0 ? row.gatherKg : 0,
+    gatherBatchId: typeof row.gatherBatchId === 'string' ? row.gatherBatchId : '',
+    gatherAt: typeof row.gatherAt === 'string' ? row.gatherAt : row.createdAt,
+    gatherState: row.gatherState === '已记账' || row.gatherState === '待记账' || row.gatherState === '待重交' ? row.gatherState : '待记账',
+  }
+}
+
+/** 取料对账结果：按侧恢复——熔化工侧只反映已过账的扣减，技师侧保留失败道次等重交 */
+export interface GatherReconcileResult {
+  /** 成功过账的取料道次 id（按取料先后） */
+  postedStepIds: string[]
+  /** 累计扣减的余量（kg） */
+  deductedKg: number
+  /** 第一个余量不足被退回的取料道次 id；没有则为 null */
+  blockedStepId: string | null
+  /** 被退回时批次剩余的余量（kg） */
+  remainKg: number
+}
+
+/**
+ * 熔化工按批次对账（技师取料账 → 熔化工余量账）。
+ * 同一批次被多件作品取用时，按取料时间 gatherAt 先后（再按 createdAt）依次扣余量：
+ * - 余量够：取料道次过账为「已记账」，熔化工余量照常扣减；
+ * - 轮到某件余量不够：只把这一件退回为「待重交」（前面几件照旧，后面的留队等下轮）；
+ * - 按侧恢复：熔化工已扣余量不回倒，技师这笔取料记录先留着等重交。
+ * 整个过程在单个读写事务内完成，保证「先过账的不回滚」。
+ */
+export async function reconcileBatchGather(batchId: string): Promise<GatherReconcileResult> {
+  return db.transaction('rw', db.batches, db.steps, async () => {
+    const batch = await db.batches.get(batchId)
+    if (batch === undefined) {
+      return { postedStepIds: [], deductedKg: 0, blockedStepId: null, remainKg: 0 }
+    }
+
+    const queue = (await db.steps.where('gatherBatchId').equals(batchId).toArray())
+      .map(normalizeStep)
+      .filter((step) => PENDING_GATHER_STATES.includes(step.gatherState as GatherState))
+      .sort((a, b) => a.gatherAt.localeCompare(b.gatherAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+
+    let remain = batch.remainKg
+    const postedStepIds: string[] = []
+    let blockedStepId: string | null = null
+    const stamp = nowIso()
+
+    for (const step of queue) {
+      // 轮到哪件不够就只退回这一件：立即停止，前几件照旧，后续道次保持原状等下轮
+      if (roundKg(remain) + KG_EPSILON < roundKg(step.gatherKg)) {
+        blockedStepId = step.id
+        await db.steps.update(step.id, { gatherState: '待重交', updatedAt: stamp })
+        break
+      }
+      remain = roundKg(remain - step.gatherKg)
+      postedStepIds.push(step.id)
+      await db.steps.update(step.id, { gatherState: '已记账', updatedAt: stamp })
+    }
+
+    const deductedKg = roundKg(batch.remainKg - remain)
+    if (postedStepIds.length > 0) {
+      await db.batches.update(batchId, { remainKg: remain, updatedAt: stamp })
+    }
+    return { postedStepIds, deductedKg, blockedStepId, remainKg: remain }
+  })
+}
+
+/**
+ * 技师重交单笔取料：余额够则该道次单独过账并扣余量；不够则继续保留「待重交」，
+ * 熔化工余量不往回倒。返回是否过账成功。
+ */
+export async function retryGatherStep(stepId: string): Promise<boolean> {
+  return db.transaction('rw', db.batches, db.steps, async () => {
+    const step = await db.steps.get(stepId)
+    if (step === undefined || step.name !== '取料' || step.gatherBatchId === '') return false
+    const batch = await db.batches.get(step.gatherBatchId)
+    if (batch === undefined) return false
+    // 待记账 / 待重交 才允许重交；已记账的不重复扣余量
+    if (step.gatherState !== '待记账' && step.gatherState !== '待重交') return false
+    if (roundKg(batch.remainKg) + KG_EPSILON < roundKg(step.gatherKg)) {
+      await db.steps.update(stepId, { gatherState: '待重交', updatedAt: nowIso() })
+      return false
+    }
+    const stamp = nowIso()
+    await db.batches.update(batch.id, { remainKg: roundKg(batch.remainKg - step.gatherKg), updatedAt: stamp })
+    await db.steps.update(stepId, { gatherState: '已记账', updatedAt: stamp })
+    return true
+  })
 }
 
 /* -------------------------------- 作品 -------------------------------- */
@@ -220,7 +373,7 @@ export async function listStepsByPiece(pieceId: string): Promise<Step[]> {
 }
 
 export async function putStep(row: Step): Promise<void> {
-  await db.steps.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.steps.put({ ...normalizeStep(row), updatedAt: nowIso(), revision: ROW_REVISION })
   await syncPieceState(row.pieceId)
 }
 
@@ -334,7 +487,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+    // 旧版存档的取料道次可能缺取料字段，统一按归属补齐，不自动过账（不扣余量）
+    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...normalizeStep(row), revision: ROW_REVISION })))
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })

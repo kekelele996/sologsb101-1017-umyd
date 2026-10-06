@@ -97,6 +97,8 @@ export function buildScheduleCsv(
     '工序数',
     '已完成工序',
     '累计工时(分钟)',
+    '取料量合计(kg)',
+    '取料对账状态',
     '退火记录数',
     '退火窑位',
     '退火状态',
@@ -109,6 +111,15 @@ export function buildScheduleCsv(
     const batch = batches.find((row) => row.id === piece.batchId)
     const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
+    const gatherSteps = pieceSteps.filter((row) => row.name === '取料')
+    const gatherKg = Math.round(gatherSteps.reduce((acc, row) => acc + row.gatherKg, 0) * 10) / 10
+    const pendingGather = gatherSteps.filter((row) => row.gatherState === '待记账' || row.gatherState === '待重交')
+    const gatherStateText =
+      gatherSteps.length === 0
+        ? '—'
+        : pendingGather.length === 0
+          ? `已记账 ${gatherSteps.length} 笔`
+          : `${pendingGather.map((row) => (row.gatherState === '待重交' ? '待重交' : '待记账')).join(' / ')} ${pendingGather.length} 笔`
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
@@ -126,6 +137,8 @@ export function buildScheduleCsv(
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
+        gatherSteps.length === 0 ? '—' : gatherKg,
+        gatherStateText,
         pieceAnneals.length,
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
@@ -191,10 +204,16 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      const gatherText =
+        row.name === '取料'
+          ? ` · 取料 ${row.gatherKg} kg · 归属 ${batch?.colorCode ?? '未关联批次'} · 取料于 ${row.gatherAt.replace('T', ' ')}${
+              row.gatherState === '' ? '' : ` · ${row.gatherState}`
+            }`
+          : ''
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        }${gatherText}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {

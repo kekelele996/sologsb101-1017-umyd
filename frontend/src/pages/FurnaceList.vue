@@ -1,8 +1,10 @@
 <script setup lang="ts">
 /**
  * /furnaces 窑炉与料液台账
- * 新建窑炉、登记料液批次与剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
- * 消费模型：Furnace、GlassBatch；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
+ * 新建窑炉、登记料液批次与剩余量；取料量记在作品的取料道次上，余量仍归本页这本账。
+ * 月底按批次对账：同一批次被多件作品取用时按取料先后扣余量，轮到哪件不够只退回这一件，
+ * 失败后按侧恢复（技师记录留「待重交」等重交，熔化工余量不回倒）；低于阈值高亮提示补料。
+ * 消费模型：Furnace、GlassBatch、Step、Piece；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -10,7 +12,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
-import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useFurnaceStore, type GatherLedgerRow } from '@/stores/furnaceStore'
 import {
   FUEL_TYPE_OPTIONS,
   FURNACE_STATE_OPTIONS,
@@ -22,6 +24,7 @@ import {
   type FurnaceType,
 } from '@/types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '@/types/batch'
+import { GATHER_STATE_META } from '@/types/step'
 import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
 
@@ -29,12 +32,12 @@ const store = useFurnaceStore()
 
 const furnaceDialog = ref(false)
 const batchDialog = ref(false)
-const consumeDialog = ref(false)
+const reconcileDialog = ref(false)
 const submitting = ref(false)
+const reconcileBusy = ref(false)
 const editingFurnaceId = ref<string | null>(null)
 const editingBatchId = ref<string | null>(null)
-const consumeTarget = ref<GlassBatch | null>(null)
-const consumeKg = ref(5)
+const reconcileTarget = ref<GlassBatch | null>(null)
 const refillKg = ref(50)
 const furnaceFormRef = ref<FormInstance>()
 const batchFormRef = ref<FormInstance>()
@@ -90,6 +93,7 @@ const totals = computed(() => ({
   runningCount: store.furnaces.filter((row) => row.state === '运行').length,
   meltFurnaces: store.meltingFurnaces.length,
   annealFurnaces: store.annealingFurnaces.length,
+  pendingGather: store.pendingGatherCount,
 }))
 
 onMounted(() => {
@@ -212,26 +216,52 @@ async function deleteBatch(row: GlassBatch): Promise<void> {
   ElMessage.success('料液批次已删除')
 }
 
-function openConsume(row: GlassBatch): void {
-  consumeTarget.value = row
-  consumeKg.value = Math.min(10, row.remainKg)
-  consumeDialog.value = true
+function openReconcile(row: GlassBatch): void {
+  reconcileTarget.value = row
+  reconcileDialog.value = true
 }
 
-async function submitConsume(): Promise<void> {
-  const target = consumeTarget.value
+/** 打开弹窗时看到的台账快照（待过账按取料先后排队，已记账为熔化工已扣部分） */
+const reconcileLedger = computed(() =>
+  reconcileTarget.value === null ? null : store.gatherLedgerOf(reconcileTarget.value.id),
+)
+
+/** 待过账队列（待记账 + 待重交），按取料先后 */
+const pendingGatherRows = computed<GatherLedgerRow[]>(() => reconcileLedger.value?.pending ?? [])
+
+async function submitReconcile(): Promise<void> {
+  const target = reconcileTarget.value
   if (target === null) return
-  const actual = await store.consume(target.id, consumeKg.value)
-  ElMessage.success(`已取料 ${actual} kg`)
-  if (isLowRemain(target.remainKg - actual)) {
-    ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`, )
+  reconcileBusy.value = true
+  try {
+    const result = await store.reconcile(target.id)
+    if (result.postedStepIds.length > 0) {
+      ElMessage.success(`已按取料先后过账 ${result.postedStepIds.length} 笔，扣减 ${result.deductedKg} kg，余量 ${result.remainKg} kg`)
+    }
+    if (result.blockedStepId !== null) {
+      ElMessage.error('轮到本件取料时余量不足：只退回这一件（待重交），前面几件照旧，熔化工余量不回倒')
+    }
+    if (result.postedStepIds.length === 0 && result.blockedStepId === null) {
+      ElMessage.info('该批次没有待过账的取料道次')
+    }
+    if (result.blockedStepId === null && result.postedStepIds.length > 0 && isLowRemain(result.remainKg)) {
+      ElMessage.warning(`${target.colorCode} 剩余 ${result.remainKg} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`)
+    }
+    if (result.blockedStepId === null) reconcileDialog.value = false
+  } finally {
+    reconcileBusy.value = false
   }
-  consumeDialog.value = false
+}
+
+/** 台账列表里对单笔「待重交 / 待记账」直接重交 */
+async function submitLedgerRow(row: GatherLedgerRow): Promise<void> {
+  const ok = await store.retryStep(row.step.id)
+  ElMessage[ok ? 'success' : 'error'](store.lastMessage)
 }
 
 async function submitRefill(row: GlassBatch): Promise<void> {
   await store.refill(row.id, refillKg.value)
-  ElMessage.success(`已补料 ${refillKg.value} kg`)
+  ElMessage.success(`已补料 ${refillKg.value} kg，待重交的取料可通知技师重交`)
 }
 
 function batchRowClass({ row }: { row: GlassBatch }): string {
@@ -261,7 +291,29 @@ function handleFurnaceFilter(key: string, value: string): void {
         icon="Warning"
         :hint="`剩余量低于 ${LOW_REMAIN_KG} kg 的料液批次数量`"
       />
+      <StatBadge
+        label="待过账取料"
+        :value="totals.pendingGather"
+        suffix="笔"
+        :tone="totals.pendingGather > 0 ? 'danger' : 'success'"
+        icon="Warning"
+        hint="技师记在作品取料道次上、尚未与批次余量对上账的取料笔数"
+      />
     </div>
+
+    <el-alert
+      v-if="totals.pendingGather > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${totals.pendingGather} 笔取料尚未与熔化工批次余量对上账，请按批次对账`"
+    >
+      <template #default>
+        同一批次被多件作品取用时按取料先后扣余量；轮到哪件不够就只退回这一件（待重交），
+        技师这笔取料先留着等重交，熔化工余量不往回倒。
+      </template>
+    </el-alert>
 
     <el-alert
       v-if="store.lowRemainBatches.length > 0"
@@ -384,7 +436,7 @@ function handleFurnaceFilter(key: string, value: string): void {
       <EmptyPanel
         v-if="store.batches.length === 0 && !store.loading"
         title="还没有料液批次"
-        description="为熔化炉或坩埚炉登记色号、配方、熔化日期与剩余量；取料时会自动按剩余量扣减，低于阈值会高亮提示补料。"
+        description="为熔化炉或坩埚炉登记色号、配方、熔化日期与剩余量；取料量由技师记在作品的取料道次上，月底按批次对账扣余量，低于阈值会高亮提示补料。"
         action-text="登记第一批料液"
         @action="openCreateBatch"
       />
@@ -419,10 +471,31 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="取料 / 补料" width="300">
+        <el-table-column label="取料账" width="150" align="right">
+          <template #default="{ row }">
+            <div class="gather-ledger-cell">
+              <span>已记 <b>{{ store.gatherLedgerOf(row.id).postedKg }} kg</b></span>
+              <el-tag
+                v-if="store.gatherLedgerOf(row.id).pending.length > 0"
+                size="small"
+                :type="store.gatherLedgerOf(row.id).retryCount > 0 ? 'danger' : 'warning'"
+              >
+                待过账 {{ store.gatherLedgerOf(row.id).pending.length }} 笔
+              </el-tag>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账 / 补料" width="320">
           <template #default="{ row }">
             <el-space>
-              <el-button size="small" type="primary" plain @click="openConsume(row)">取料</el-button>
+              <el-button size="small" type="primary" plain @click="openReconcile(row)">
+                对账取料
+                <el-badge
+                  v-if="store.gatherLedgerOf(row.id).pending.length > 0"
+                  :value="store.gatherLedgerOf(row.id).pending.length"
+                  class="reconcile-badge"
+                />
+              </el-button>
               <el-input-number v-model="refillKg" :min="1" :max="2000" :step="10" size="small" style="width: 110px" />
               <el-button size="small" @click="submitRefill(row)">补料</el-button>
             </el-space>
@@ -539,19 +612,73 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="consumeDialog" title="取料" width="460px">
-      <p class="dialog-tip">
-        {{ consumeTarget?.colorCode }} 当前剩余
-        <b>{{ consumeTarget?.remainKg }} kg</b>，取料后按剩余量扣减；不足时扣到 0。
+    <el-dialog v-model="reconcileDialog" title="按批次对账取料" width="720px">
+      <p class="dialog-tip" v-if="reconcileTarget">
+        {{ reconcileTarget.colorCode }} 当前熔化工余量 <b>{{ reconcileTarget.remainKg }} kg</b>。
+        同一批次被多件作品取用时，按下面「取料时间」先后依次扣余量：
+        轮到哪件不够就只把这一件退回「待重交」，前面几件照旧，熔化工余量不回倒。
       </p>
-      <el-form label-width="110px">
-        <el-form-item label="取料量（kg）">
-          <el-input-number v-model="consumeKg" :min="0.5" :max="consumeTarget?.remainKg ?? 100" :step="0.5" style="width: 100%" />
-        </el-form-item>
-      </el-form>
+
+      <el-table
+        v-if="reconcileLedger"
+        :data="pendingGatherRows"
+        size="small"
+        stripe
+        empty-text="没有待过账的取料道次（技师账与熔化工余量已对齐）"
+      >
+        <el-table-column label="取料时间" width="150">
+          <template #default="{ row }">{{ row.step.gatherAt.replace('T', ' ') }}</template>
+        </el-table-column>
+        <el-table-column label="作品" min-width="150">
+          <template #default="{ row }">
+            <div class="cell-stack">
+              <span class="cell-strong">{{ row.pieceName }}</span>
+              <span class="cell-sub">技师 {{ row.artist }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="取料量" width="90" align="right">
+          <template #default="{ row }">{{ row.step.gatherKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="技师账状态" width="100">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.step.gatherState !== ''"
+              size="small"
+              :type="GATHER_STATE_META[row.step.gatherState as '待记账' | '已记账' | '待重交'].tone"
+            >
+              {{ GATHER_STATE_META[row.step.gatherState as '待记账' | '已记账' | '待重交'].label }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="100" align="center">
+          <template #default="{ row }">
+            <el-button size="small" type="warning" plain @click="submitLedgerRow(row)">
+              {{ row.step.gatherState === '待重交' ? '重交' : '过账' }}
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <el-alert
+        v-if="reconcileLedger && reconcileLedger.posted.length > 0"
+        type="success"
+        show-icon
+        :closable="false"
+        class="mt-12"
+        :title="`已记账 ${reconcileLedger.posted.length} 笔，合计 ${reconcileLedger.postedKg} kg（熔化工余量已按笔扣减，不回倒）`"
+      />
+
       <template #footer>
-        <el-button @click="consumeDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitConsume">确认取料</el-button>
+        <el-button @click="reconcileDialog = false">关闭</el-button>
+        <el-button
+          type="primary"
+          :loading="reconcileBusy"
+          :disabled="pendingGatherRows.length === 0"
+          @click="submitReconcile"
+        >
+          按取料先后对账
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -612,6 +739,25 @@ function handleFurnaceFilter(key: string, value: string): void {
   margin: 0 0 12px;
   font-size: 13px;
   color: #5b6b7a;
+}
+
+.gather-ledger-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.gather-ledger-cell b {
+  color: #1d2b3a;
+}
+
+.reconcile-badge {
+  margin-left: 4px;
+}
+
+.mt-12 {
+  margin-top: 12px;
 }
 
 .mt-14 {

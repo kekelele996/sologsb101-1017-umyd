@@ -1,25 +1,30 @@
 /**
  * 窑炉与料液状态管理（Pinia）
- * 维护窑炉列表、料液批次及剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
+ * 维护窑炉列表、料液批次余量与作品取料道次。
+ * 取料量记在作品的取料道次上，余量仍归熔化工批次台账；
+ * 对账按取料先后扣余量，不够的只退回这一件（待重交），熔化工余量不回倒。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Furnace, FurnaceDraft, FurnaceState, FurnaceType } from '../types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '../types/batch'
+import type { Step } from '../types/step'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
-  consumeBatch,
   countAll,
   db,
   initDatabase,
   putBatch,
   putFurnace,
+  reconcileBatchGather,
   removeBatch,
   removeFurnace,
+  retryGatherStep,
+  type GatherReconcileResult,
 } from '../utils/db'
-import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
+import { isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 窑炉筛选条件 */
@@ -39,6 +44,28 @@ export interface FurnaceStat {
   pieceCount: number
 }
 
+/** 取料道次在对账面板中的行视图（关联作品名 / 色号等） */
+export interface GatherLedgerRow {
+  step: Step
+  pieceName: string
+  artist: string
+  colorCode: string
+}
+
+/** 单个批次的取料台账派生数据 */
+export interface BatchGatherLedger {
+  /** 待过账（待记账 + 待重交），按取料时间先后排队 */
+  pending: GatherLedgerRow[]
+  /** 已记账（熔化工余量已扣） */
+  posted: GatherLedgerRow[]
+  /** 待重交道次数（pending 中对账失败被退回的部分） */
+  retryCount: number
+  /** 已记账取料量合计（kg，技师账） */
+  postedKg: number
+  /** 待过账取料量合计（kg） */
+  pendingKg: number
+}
+
 const EMPTY_FILTERS: FurnaceFilters = { keyword: '', type: 'all', state: 'all' }
 
 const EMPTY_STAT: Omit<FurnaceStat, 'furnaceId'> = {
@@ -53,7 +80,8 @@ let subscribed = false
 export const useFurnaceStore = defineStore('furnace', () => {
   const furnaces = ref<Furnace[]>([])
   const batches = ref<GlassBatch[]>([])
-  const pieces = ref<{ id: string; batchId: string }[]>([])
+  const pieces = ref<{ id: string; batchId: string; name: string; artist: string }[]>([])
+  const gatherSteps = ref<Step[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -106,6 +134,52 @@ export const useFurnaceStore = defineStore('furnace', () => {
     return batches.value.filter((row) => row.furnaceId === furnaceId)
   }
 
+  /** 作品名 / 创作者映射，供取料台账展示 */
+  const pieceInfoById = computed<Record<string, { name: string; artist: string }>>(() =>
+    Object.fromEntries(pieces.value.map((row) => [row.id, { name: row.name, artist: row.artist }])),
+  )
+
+  function colorOf(batchId: string): string {
+    return batches.value.find((row) => row.id === batchId)?.colorCode ?? '未知色号'
+  }
+
+  /**
+   * 某批次的取料台账：
+   * 待过账队列（待记账 + 待重交）按取料先后排队；已记账为熔化工已扣余量的部分。
+   */
+  function gatherLedgerOf(batchId: string): BatchGatherLedger {
+    const rows = gatherSteps.value
+      .filter((step) => step.gatherBatchId === batchId)
+      .sort(
+        (a, b) =>
+          a.gatherAt.localeCompare(b.gatherAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+      )
+    const toRow = (step: Step): GatherLedgerRow => ({
+      step,
+      pieceName: pieceInfoById.value[step.pieceId]?.name ?? '（作品已删除）',
+      artist: pieceInfoById.value[step.pieceId]?.artist ?? step.operator,
+      colorCode: colorOf(step.gatherBatchId),
+    })
+    const pending = rows
+      .filter((step) => step.gatherState === '待记账' || step.gatherState === '待重交')
+      .map(toRow)
+    const posted = rows.filter((step) => step.gatherState === '已记账').map(toRow)
+    const sumKg = (list: GatherLedgerRow[]): number =>
+      Math.round(list.reduce((acc, row) => acc + row.step.gatherKg, 0) * 10) / 10
+    return {
+      pending,
+      posted,
+      retryCount: pending.filter((row) => row.step.gatherState === '待重交').length,
+      postedKg: sumKg(posted),
+      pendingKg: sumKg(pending),
+    }
+  }
+
+  /** 全工作室待过账取料道次数（顶部徽标） */
+  const pendingGatherCount = computed<number>(
+    () => gatherSteps.value.filter((step) => step.gatherState === '待记账' || step.gatherState === '待重交').length,
+  )
+
   async function loadAll(): Promise<void> {
     loading.value = true
     error.value = ''
@@ -114,17 +188,21 @@ export const useFurnaceStore = defineStore('furnace', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [furnaceRows, batchRows, pieceRows] = await Promise.all([
+          const [furnaceRows, batchRows, pieceRows, stepRows] = await Promise.all([
             db.furnaces.toArray(),
             db.batches.toArray(),
             db.pieces.toArray(),
+            db.steps.toArray(),
           ])
-          return { furnaceRows, batchRows, pieceRows }
+          return { furnaceRows, batchRows, pieceRows, stepRows }
         }).subscribe({
-          next: ({ furnaceRows, batchRows, pieceRows }) => {
+          next: ({ furnaceRows, batchRows, pieceRows, stepRows }) => {
             furnaces.value = [...furnaceRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             batches.value = [...batchRows].sort((a, b) => b.meltDate.localeCompare(a.meltDate))
-            pieces.value = pieceRows.map((row) => ({ id: row.id, batchId: row.batchId }))
+            pieces.value = pieceRows.map((row) => ({ id: row.id, batchId: row.batchId, name: row.name, artist: row.artist }))
+            gatherSteps.value = stepRows
+              .filter((row) => row.name === '取料')
+              .sort((a, b) => a.gatherAt.localeCompare(b.gatherAt) || a.createdAt.localeCompare(b.createdAt))
             loading.value = false
             ready.value = true
             error.value = ''
@@ -230,18 +308,37 @@ export const useFurnaceStore = defineStore('furnace', () => {
     revision.value += 1
   }
 
-  /** 取料：按剩余量扣减，返回实际扣减量 */
-  async function consume(batchId: string, kg: number): Promise<number> {
-    const actual = await consumeBatch(batchId, kg)
+  /**
+   * 熔化工按月对账：同一批次被多件作品取用时，按取料先后扣余量。
+   * 轮到哪件不够就只退回这一件（待重交），前面几件照旧；熔化工余量不回倒。
+   */
+  async function reconcile(batchId: string): Promise<GatherReconcileResult> {
+    const result = await reconcileBatchGather(batchId)
     revision.value += 1
     const batch = batches.value.find((row) => row.id === batchId)
     if (batch !== undefined) {
-      const remain = Math.round((batch.remainKg - actual) * 10) / 10
-      lastMessage.value = isLowRemain(remain)
-        ? `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`
-        : `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg`
+      if (result.postedStepIds.length > 0) {
+        lastMessage.value = `${batch.colorCode} 对账过账 ${result.postedStepIds.length} 笔，扣减 ${result.deductedKg} kg，剩余 ${result.remainKg} kg`
+      } else if (result.blockedStepId !== null) {
+        lastMessage.value = `${batch.colorCode} 余量仅 ${result.remainKg} kg，本笔取料不足，已退回该件为「待重交」，熔化工余量不回倒`
+      } else {
+        lastMessage.value = `${batch.colorCode} 没有待过账的取料道次`
+      }
     }
-    return actual
+    return result
+  }
+
+  /** 技师重交单笔取料：余额够才过账扣余量，不够继续留「待重交」等补料 */
+  async function retryStep(stepId: string): Promise<boolean> {
+    const ok = await retryGatherStep(stepId)
+    revision.value += 1
+    const step = gatherSteps.value.find((row) => row.id === stepId)
+    if (step !== undefined) {
+      lastMessage.value = ok
+        ? `取料 ${step.gatherKg} kg 已重交过账，${colorOf(step.gatherBatchId)} 余量已扣减`
+        : `${colorOf(step.gatherBatchId)} 余量仍不足，取料记录保留「待重交」，熔化工余量不回倒`
+    }
+    return ok
   }
 
   /** 补料：直接增加剩余量 */
@@ -271,10 +368,12 @@ export const useFurnaceStore = defineStore('furnace', () => {
     meltingFurnaces,
     annealingFurnaces,
     lowRemainBatches,
+    pendingGatherCount,
     stats,
     visibleFurnaces,
     statOf,
     batchesOf,
+    gatherLedgerOf,
     loadAll,
     setFilters,
     resetFilters,
@@ -284,7 +383,8 @@ export const useFurnaceStore = defineStore('furnace', () => {
     createBatch,
     updateBatch,
     deleteBatch,
-    consume,
+    reconcile,
+    retryStep,
     refill,
     refreshCounts,
   }
