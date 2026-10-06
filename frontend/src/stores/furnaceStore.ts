@@ -1,25 +1,29 @@
 /**
  * 窑炉与料液状态管理（Pinia）
- * 维护窑炉列表、料液批次及剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
+ * 维护窑炉列表、料液批次及剩余量；取料由技师记在作品的「取料」道次上，
+ * 月底对账时按取料先后扣减批次余量，低于阈值高亮提示补料。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Furnace, FurnaceDraft, FurnaceState, FurnaceType } from '../types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '../types/batch'
+import type { Step } from '../types/step'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
-  consumeBatch,
   countAll,
   db,
   initDatabase,
   putBatch,
   putFurnace,
+  reconcileBatchDraws,
   removeBatch,
   removeFurnace,
+  type ReconcileResult,
 } from '../utils/db'
-import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
+import { pendingDrawsOfBatch, reconcileMessage, type PendingDraw } from '../utils/ledger'
+import { isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 窑炉筛选条件 */
@@ -53,7 +57,8 @@ let subscribed = false
 export const useFurnaceStore = defineStore('furnace', () => {
   const furnaces = ref<Furnace[]>([])
   const batches = ref<GlassBatch[]>([])
-  const pieces = ref<{ id: string; batchId: string }[]>([])
+  const pieces = ref<{ id: string; batchId: string; name: string }[]>([])
+  const steps = ref<Step[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -67,6 +72,11 @@ export const useFurnaceStore = defineStore('furnace', () => {
   )
   const annealingFurnaces = computed<Furnace[]>(() => furnaces.value.filter((row) => row.type === '退火窑'))
   const lowRemainBatches = computed<GlassBatch[]>(() => batches.value.filter((row) => isLowRemain(row.remainKg)))
+
+  /** 全部待入账取料笔数（跨批次汇总，用于顶部统计） */
+  const pendingDrawCount = computed<number>(() =>
+    batches.value.reduce((acc, batch) => acc + pendingDrawsOf(batch.id).length, 0),
+  )
 
   const stats = computed<Record<string, FurnaceStat>>(() => {
     const result: Record<string, FurnaceStat> = {}
@@ -114,17 +124,19 @@ export const useFurnaceStore = defineStore('furnace', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [furnaceRows, batchRows, pieceRows] = await Promise.all([
+          const [furnaceRows, batchRows, pieceRows, stepRows] = await Promise.all([
             db.furnaces.toArray(),
             db.batches.toArray(),
             db.pieces.toArray(),
+            db.steps.toArray(),
           ])
-          return { furnaceRows, batchRows, pieceRows }
+          return { furnaceRows, batchRows, pieceRows, stepRows }
         }).subscribe({
-          next: ({ furnaceRows, batchRows, pieceRows }) => {
+          next: ({ furnaceRows, batchRows, pieceRows, stepRows }) => {
             furnaces.value = [...furnaceRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             batches.value = [...batchRows].sort((a, b) => b.meltDate.localeCompare(a.meltDate))
-            pieces.value = pieceRows.map((row) => ({ id: row.id, batchId: row.batchId }))
+            pieces.value = pieceRows.map((row) => ({ id: row.id, batchId: row.batchId, name: row.name }))
+            steps.value = stepRows
             loading.value = false
             ready.value = true
             error.value = ''
@@ -230,18 +242,28 @@ export const useFurnaceStore = defineStore('furnace', () => {
     revision.value += 1
   }
 
-  /** 取料：按剩余量扣减，返回实际扣减量 */
-  async function consume(batchId: string, kg: number): Promise<number> {
-    const actual = await consumeBatch(batchId, kg)
+  /** 某批次名下的待入账取料（技师账，跨作品，未排序） */
+  function pendingDrawsOf(batchId: string): PendingDraw[] {
+    return pendingDrawsOfBatch(batchId, pieces.value, steps.value)
+  }
+
+  /**
+   * 月底对账：按取料先后扣余量；轮到哪件不够就只退回那一件（留在技师账上等重交），
+   * 前面已入账的照旧，熔化工的余量不往回倒。
+   */
+  async function reconcile(batchId: string): Promise<ReconcileResult | null> {
+    const result = await reconcileBatchDraws(batchId)
     revision.value += 1
     const batch = batches.value.find((row) => row.id === batchId)
-    if (batch !== undefined) {
-      const remain = Math.round((batch.remainKg - actual) * 10) / 10
-      lastMessage.value = isLowRemain(remain)
-        ? `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`
-        : `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg`
+    if (result !== null && batch !== undefined) {
+      lastMessage.value = reconcileMessage(
+        { ...batch, remainKg: result.remainKg },
+        result.postedCount,
+        result.postedKg,
+        result.rejectedCount,
+      )
     }
-    return actual
+    return result
   }
 
   /** 补料：直接增加剩余量 */
@@ -271,6 +293,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     meltingFurnaces,
     annealingFurnaces,
     lowRemainBatches,
+    pendingDrawCount,
     stats,
     visibleFurnaces,
     statOf,
@@ -284,7 +307,8 @@ export const useFurnaceStore = defineStore('furnace', () => {
     createBatch,
     updateBatch,
     deleteBatch,
-    consume,
+    pendingDrawsOf,
+    reconcile,
     refill,
     refreshCounts,
   }

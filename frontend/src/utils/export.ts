@@ -11,6 +11,7 @@ import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
+import { pieceDrawPending, pieceDrawTotal } from './ledger'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
 /** 触发浏览器下载 */
@@ -97,6 +98,8 @@ export function buildScheduleCsv(
     '工序数',
     '已完成工序',
     '累计工时(分钟)',
+    '取料合计(kg)',
+    '待入账取料(kg)',
     '退火记录数',
     '退火窑位',
     '退火状态',
@@ -126,6 +129,8 @@ export function buildScheduleCsv(
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
+        pieceDrawTotal(piece.id, steps),
+        pieceDrawPending(piece.id, steps),
         pieceAnneals.length,
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
@@ -191,10 +196,11 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      const drawText = row.name === '取料' ? ` · 取料 ${row.drawKg} kg（${row.drawState}）` : ''
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        }${drawText}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {

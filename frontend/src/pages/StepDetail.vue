@@ -2,6 +2,8 @@
 /**
  * /pieces/:id/steps 吹制工序逐道记录
  * 拖拽排序并回填温度、时长与操作人；任一前序未完成则阻断进入退火排位。
+ * 「取料」道次额外记录取料量（技师账）：新登记挂「待入账」，月底对账才扣批次余量；
+ * 对账被退回的笔留在本页等修改后重交，熔化工的余量不往回倒。
  * 消费模型：Step、Piece、GlassBatch、Furnace；复用组件：<StageTag>、<StatBadge>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -13,7 +15,7 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type DrawState, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
 
@@ -42,6 +44,7 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  drawKg: 3,
 })
 
 const rules: FormRules<StepDraft> = {
@@ -51,9 +54,34 @@ const rules: FormRules<StepDraft> = {
   durationMin: [{ required: true, message: '请填写时长', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择工序状态', trigger: 'change' }],
+  drawKg: [
+    {
+      validator: (_rule: unknown, value: number, callback: (error?: Error) => void) => {
+        if (form.name === '取料' && (typeof value !== 'number' || Number.isNaN(value) || value <= 0)) {
+          callback(new Error('取料道次必须填写大于 0 的取料量'))
+        } else {
+          callback()
+        }
+      },
+      trigger: 'blur',
+    },
+  ],
 }
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
+
+/** 对账时被退回（余量不足）的取料道次：留在技师账上等重交 */
+const rejectedDraws = computed<Step[]>(() =>
+  steps.value.filter((row) => row.name === '取料' && row.drawState === '待重交'),
+)
+
+/** 正在编辑的道次 */
+const editingStep = computed<Step | null>(() => steps.value.find((row) => row.id === editingId.value) ?? null)
+
+/** 已入账的取料道次锁定取料量：熔化工的余量不往回倒 */
+const drawPostedLocked = computed<boolean>(
+  () => editingStep.value !== null && editingStep.value.name === '取料' && editingStep.value.drawState === '已入账',
+)
 
 const batch = computed(() =>
   piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
@@ -87,6 +115,7 @@ function openCreate(): void {
     operator: currentStep.value?.operator ?? '',
     remark: '',
     state: '未开始' as StepState,
+    drawKg: 3,
   })
   dialogVisible.value = true
 }
@@ -102,6 +131,7 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    drawKg: row.name === '取料' ? row.drawKg : 3,
   })
   dialogVisible.value = true
 }
@@ -117,10 +147,17 @@ async function handleSubmit(): Promise<void> {
   try {
     if (editingId.value === null) {
       await pieceStore.createStep({ ...form })
-      ElMessage.success(`已新增第 ${form.seq} 道「${form.name}」`)
+      ElMessage.success(
+        form.name === '取料'
+          ? `已新增第 ${form.seq} 道「取料」（${form.drawKg} kg，待入账，月底对账后扣批次余量）`
+          : `已新增第 ${form.seq} 道「${form.name}」`,
+      )
     } else {
+      const wasRejected = editingStep.value?.drawState === '待重交'
       await pieceStore.updateStep(editingId.value, { ...form })
-      ElMessage.success('工序已更新')
+      ElMessage.success(
+        form.name === '取料' && wasRejected ? '取料已重交，挂「待入账」等下次对账' : '工序已更新',
+      )
     }
     dialogVisible.value = false
   } finally {
@@ -171,6 +208,11 @@ function goAnnealing(): void {
   }
   pieceStore.selectPiece(piece.value.id)
   void router.push('/annealing')
+}
+
+/** 取料入账状态对应的标签色调 */
+function drawTagType(state: DrawState): 'success' | 'warning' | 'danger' {
+  return state === '已入账' ? 'success' : state === '待入账' ? 'warning' : 'danger'
 }
 </script>
 
@@ -239,6 +281,16 @@ function goAnnealing(): void {
         :description="`理论退火时长 ${formatHours(totalAnnealHours(piece?.wallThicknessMm ?? 4))}（升温 / 保温 / 缓冷三段合计）。`"
       />
 
+      <el-alert
+        v-if="rejectedDraws.length > 0"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`有 ${rejectedDraws.length} 笔取料对账时被退回（批次余量不足）`"
+        description="按侧恢复：这笔取料先留在技师账上（待重交），请在对应道次修改取料量后保存重交；熔化工的余量不往回倒。"
+      />
+
       <el-card shadow="never">
         <template #header>
           <div class="card-header">
@@ -291,11 +343,17 @@ function goAnnealing(): void {
                 >
                   {{ row.state }}
                 </el-tag>
+                <el-tag v-if="row.name === '取料'" size="small" :type="drawTagType(row.drawState)" effect="plain">
+                  取料 {{ row.drawKg }} kg · {{ row.drawState }}
+                </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
+              </div>
+              <div v-if="row.name === '取料' && row.drawState === '待重交'" class="step-draw-hint">
+                对账时批次余量不足被退回：修改取料量后保存即可重交，已入账的余量不回倒。
               </div>
             </div>
             <div class="step-actions">
@@ -354,6 +412,35 @@ function goAnnealing(): void {
             <el-form-item label="操作人" prop="operator">
               <el-input v-model="form.operator" placeholder="如：林曦" />
             </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row v-if="form.name === '取料'" :gutter="12">
+          <el-col :span="8">
+            <el-form-item label="取料量（kg）" prop="drawKg">
+              <el-input-number
+                v-model="form.drawKg"
+                :min="0.1"
+                :max="500"
+                :step="0.1"
+                :precision="1"
+                :disabled="drawPostedLocked"
+                style="width: 100%"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :span="16">
+            <el-alert
+              :type="drawPostedLocked ? 'info' : editingStep?.drawState === '待重交' ? 'warning' : 'info'"
+              show-icon
+              :closable="false"
+              :title="
+                drawPostedLocked
+                  ? '该笔已入账：取料量不可再改，熔化工的余量不往回倒。'
+                  : editingStep?.drawState === '待重交'
+                    ? '该笔对账时被退回：修改取料量后保存即重交，重新挂「待入账」。'
+                    : '取料量与操作人记到技师账上，月底对账时才从批次余量扣减。'
+              "
+            />
           </el-col>
         </el-row>
         <el-form-item label="备注">
@@ -465,6 +552,11 @@ function goAnnealing(): void {
 .step-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.step-draw-hint {
+  font-size: 12px;
+  color: #c0392b;
 }
 
 .step-actions {

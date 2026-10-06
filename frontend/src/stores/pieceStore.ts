@@ -195,6 +195,7 @@ export const usePieceStore = defineStore('piece', () => {
 
   async function createStep(draft: StepDraft): Promise<Step> {
     const stamp = nowIso()
+    const isDraw = draft.name === '取料'
     const row: Step = {
       id: uuid('step'),
       pieceId: draft.pieceId,
@@ -205,6 +206,9 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      // 取料量与操作人记在作品的取料道次上（技师账）；新登记的一律挂「待入账」，等月底对账才扣批次余量
+      drawKg: isDraw ? draft.drawKg : 0,
+      drawState: isDraw ? '待入账' : '已入账',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -217,6 +221,17 @@ export const usePieceStore = defineStore('piece', () => {
   async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
     const existing = steps.value.find((row) => row.id === stepId)
     if (existing === undefined) return
+    const isDraw = draft.name === '取料'
+    let drawKg = 0
+    let drawState: Step['drawState'] = '已入账'
+    if (isDraw) {
+      drawKg = draft.drawKg
+      // 入账状态流转：已入账且取料量未动 → 保持已入账（熔化工的余量不往回倒）；
+      // 待重交或取料量有改动 → 重新挂「待入账」，即技师这笔先留着、修改后重交，等下次对账
+      const keepPosted =
+        existing.name === '取料' && existing.drawState === '已入账' && draft.drawKg === existing.drawKg
+      drawState = keepPosted ? '已入账' : '待入账'
+    }
     await putStep({
       ...existing,
       seq: draft.seq,
@@ -226,6 +241,8 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      drawKg,
+      drawState,
     })
     revision.value += 1
   }

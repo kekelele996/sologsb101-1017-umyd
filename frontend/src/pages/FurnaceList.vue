@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * /furnaces 窑炉与料液台账
- * 新建窑炉、登记料液批次与剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
- * 消费模型：Furnace、GlassBatch；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
+ * 新建窑炉、登记料液批次与剩余量；取料由技师记在作品的「取料」道次上，
+ * 月底对账时按取料先后扣减批次余量（轮到哪件不够就只退回那一件），低于阈值高亮提示补料。
+ * 消费模型：Furnace、GlassBatch、Step；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -22,6 +23,7 @@ import {
   type FurnaceType,
 } from '@/types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '@/types/batch'
+import { previewReconcile, type ReconcilePreview } from '@/utils/ledger'
 import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
 
@@ -29,12 +31,11 @@ const store = useFurnaceStore()
 
 const furnaceDialog = ref(false)
 const batchDialog = ref(false)
-const consumeDialog = ref(false)
+const reconcileDialog = ref(false)
 const submitting = ref(false)
 const editingFurnaceId = ref<string | null>(null)
 const editingBatchId = ref<string | null>(null)
-const consumeTarget = ref<GlassBatch | null>(null)
-const consumeKg = ref(5)
+const reconcileTargetId = ref<string | null>(null)
 const refillKg = ref(50)
 const furnaceFormRef = ref<FormInstance>()
 const batchFormRef = ref<FormInstance>()
@@ -91,6 +92,24 @@ const totals = computed(() => ({
   meltFurnaces: store.meltingFurnaces.length,
   annealFurnaces: store.annealingFurnaces.length,
 }))
+
+/** 对账弹窗目标批次（实时取 store，保证余量是最新的） */
+const reconcileTarget = computed<GlassBatch | null>(
+  () => store.batches.find((row) => row.id === reconcileTargetId.value) ?? null,
+)
+
+/** 对账预览：按取料先后逐笔试扣，轮到哪件不够就只退回哪一件 */
+const reconcilePreview = computed<ReconcilePreview>(() => {
+  const target = reconcileTarget.value
+  if (target === null) return { rows: [], postedCount: 0, postedKg: 0, rejectedCount: 0, remainAfter: 0 }
+  return previewReconcile(target.remainKg, store.pendingDrawsOf(target.id))
+})
+
+/** 批次维度的待入账统计（列表列展示） */
+function pendingStat(batchId: string): { count: number; kg: number } {
+  const draws = store.pendingDrawsOf(batchId)
+  return { count: draws.length, kg: Math.round(draws.reduce((acc, row) => acc + row.drawKg, 0) * 10) / 10 }
+}
 
 onMounted(() => {
   void store.loadAll()
@@ -212,21 +231,27 @@ async function deleteBatch(row: GlassBatch): Promise<void> {
   ElMessage.success('料液批次已删除')
 }
 
-function openConsume(row: GlassBatch): void {
-  consumeTarget.value = row
-  consumeKg.value = Math.min(10, row.remainKg)
-  consumeDialog.value = true
+function openReconcile(row: GlassBatch): void {
+  reconcileTargetId.value = row.id
+  reconcileDialog.value = true
 }
 
-async function submitConsume(): Promise<void> {
-  const target = consumeTarget.value
+async function submitReconcile(): Promise<void> {
+  const target = reconcileTarget.value
   if (target === null) return
-  const actual = await store.consume(target.id, consumeKg.value)
-  ElMessage.success(`已取料 ${actual} kg`)
-  if (isLowRemain(target.remainKg - actual)) {
-    ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`, )
+  submitting.value = true
+  try {
+    const result = await store.reconcile(target.id)
+    reconcileDialog.value = false
+    if (result === null) return
+    // 对账失败（有退回）按侧恢复：技师的笔留着等重交，熔化工的余量不往回倒
+    ElMessage[result.rejectedCount > 0 ? 'warning' : 'success'](store.lastMessage)
+    if (isLowRemain(result.remainKg)) {
+      ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`)
+    }
+  } finally {
+    submitting.value = false
   }
-  consumeDialog.value = false
 }
 
 async function submitRefill(row: GlassBatch): Promise<void> {
@@ -253,6 +278,14 @@ function handleFurnaceFilter(key: string, value: string): void {
       <StatBadge label="运行中" :value="totals.runningCount" suffix="台" tone="success" icon="TrendCharts" />
       <StatBadge label="料液批次" :value="store.batches.length" suffix="批" tone="primary" icon="PieChart" />
       <StatBadge label="剩余总量" :value="totals.totalRemain" suffix="kg" tone="info" icon="TrendCharts" />
+      <StatBadge
+        label="待入账取料"
+        :value="store.pendingDrawCount"
+        suffix="笔"
+        :tone="store.pendingDrawCount > 0 ? 'warning' : 'success'"
+        icon="DataLine"
+        hint="技师已登记到作品取料道次、尚未与熔化工对账的取料笔数"
+      />
       <StatBadge
         label="低于补料阈值"
         :value="totals.lowCount"
@@ -384,7 +417,7 @@ function handleFurnaceFilter(key: string, value: string): void {
       <EmptyPanel
         v-if="store.batches.length === 0 && !store.loading"
         title="还没有料液批次"
-        description="为熔化炉或坩埚炉登记色号、配方、熔化日期与剩余量；取料时会自动按剩余量扣减，低于阈值会高亮提示补料。"
+        description="为熔化炉或坩埚炉登记色号、配方、熔化日期与剩余量；技师在作品取料道次上记取料量，月底对账时按取料先后扣减余量，低于阈值会高亮提示补料。"
         action-text="登记第一批料液"
         @action="openCreateBatch"
       />
@@ -419,10 +452,26 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="取料 / 补料" width="300">
+        <el-table-column label="待入账取料" width="140" align="right">
+          <template #default="{ row }">
+            <span v-if="pendingStat(row.id).count === 0" class="cell-sub">—</span>
+            <el-tag v-else size="small" type="warning">
+              {{ pendingStat(row.id).count }} 笔 · {{ pendingStat(row.id).kg }} kg
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账 / 补料" width="300">
           <template #default="{ row }">
             <el-space>
-              <el-button size="small" type="primary" plain @click="openConsume(row)">取料</el-button>
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                :disabled="pendingStat(row.id).count === 0"
+                @click="openReconcile(row)"
+              >
+                对账
+              </el-button>
               <el-input-number v-model="refillKg" :min="1" :max="2000" :step="10" size="small" style="width: 110px" />
               <el-button size="small" @click="submitRefill(row)">补料</el-button>
             </el-space>
@@ -539,19 +588,58 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="consumeDialog" title="取料" width="460px">
-      <p class="dialog-tip">
-        {{ consumeTarget?.colorCode }} 当前剩余
-        <b>{{ consumeTarget?.remainKg }} kg</b>，取料后按剩余量扣减；不足时扣到 0。
-      </p>
-      <el-form label-width="110px">
-        <el-form-item label="取料量（kg）">
-          <el-input-number v-model="consumeKg" :min="0.5" :max="consumeTarget?.remainKg ?? 100" :step="0.5" style="width: 100%" />
-        </el-form-item>
-      </el-form>
+    <el-dialog v-model="reconcileDialog" title="月底对账 · 取料入账" width="720px">
+      <template v-if="reconcileTarget !== null">
+        <p class="dialog-tip">
+          {{ reconcileTarget.colorCode }} 当前余量 <b>{{ reconcileTarget.remainKg }} kg</b>； 待入账取料
+          <b>{{ reconcilePreview.rows.length }} 笔</b>。 按取料先后逐笔扣减余量：轮到哪件不够就只退回那一件，
+          该笔留在技师账上等重交；前面已入账的照旧，熔化工的余量不往回倒。
+        </p>
+        <el-table :data="reconcilePreview.rows" size="small" stripe>
+          <el-table-column type="index" label="顺序" width="60" align="center" />
+          <el-table-column prop="pieceName" label="作品" min-width="130" />
+          <el-table-column prop="operator" label="操作人" width="90" />
+          <el-table-column label="取料量" width="100" align="right">
+            <template #default="{ row }">{{ row.drawKg }} kg</template>
+          </el-table-column>
+          <el-table-column label="取料时间" width="150">
+            <template #default="{ row }">{{ row.at.slice(0, 16).replace('T', ' ') }}</template>
+          </el-table-column>
+          <el-table-column label="对账结果" min-width="160">
+            <template #default="{ row }">
+              <el-tag v-if="row.ok" size="small" type="success">入账 · 扣后余 {{ row.remainAfter }} kg</el-tag>
+              <el-tag v-else size="small" type="danger">退回 · 余量不足</el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-alert
+          v-if="reconcilePreview.rejectedCount > 0"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="mt-14"
+          :title="`有 ${reconcilePreview.rejectedCount} 笔将因余量不足被退回`"
+          description="退回的取料保留在技师的作品工序上（待重交），技师修改取料量后重新提交，下次对账再扣；已入账的扣减不回倒。"
+        />
+        <el-alert
+          v-else-if="reconcilePreview.rows.length > 0"
+          type="success"
+          show-icon
+          :closable="false"
+          class="mt-14"
+          :title="`预计入账 ${reconcilePreview.postedCount} 笔共 ${reconcilePreview.postedKg} kg，对账后余量 ${reconcilePreview.remainAfter} kg`"
+        />
+      </template>
       <template #footer>
-        <el-button @click="consumeDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitConsume">确认取料</el-button>
+        <el-button @click="reconcileDialog = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="submitting"
+          :disabled="reconcilePreview.rows.length === 0"
+          @click="submitReconcile"
+        >
+          执行对账
+        </el-button>
       </template>
     </el-dialog>
   </div>

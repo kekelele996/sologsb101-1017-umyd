@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbglassblow
- * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值
+ * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值；
+ *   v2 → v3 为「取料」道次增加取料量与入账状态（两本账对账），历史数据按归属补默认
  * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -9,9 +10,11 @@ import Dexie, { type Table } from 'dexie'
 import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
-import type { Step } from '../types/step'
+import type { DrawState, Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import { LEGACY_DRAW_KG, parseDrawKgFromRemark, sortDrawsByTime } from './ledger'
+import { round1 } from './thermal'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
 
@@ -19,10 +22,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +49,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -91,6 +94,29 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：取料道次记取料量与入账状态（两本账），历史数据按归属补默认 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        // drawState 为 v3 新增索引（其余表结构沿用 v2）
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name, drawState',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('steps').toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION
+          // 旧数据没记取料量的道次按归属迁移：取料道次优先从备注解析，解析不到补历史默认
+          if (typeof row.drawKg !== 'number' || Number.isNaN(row.drawKg)) {
+            row.drawKg =
+              row.name === '取料'
+                ? parseDrawKgFromRemark(typeof row.remark === 'string' ? row.remark : '') ?? LEGACY_DRAW_KG
+                : 0
+          }
+          // 技师那份补历史默认：历史已完成的取料视为已入账，未完成的挂待入账等下次对账
+          if (typeof row.drawState !== 'string' || row.drawState === '') {
+            row.drawState = row.name === '取料' && row.state !== '已完成' ? '待入账' : '已入账'
+          }
         })
       })
   }
@@ -153,13 +179,56 @@ export async function removeBatch(id: string): Promise<void> {
   await db.batches.delete(id)
 }
 
-/** 取料：按剩余量扣减（不足时扣到 0 并返回实际扣减量） */
-export async function consumeBatch(batchId: string, kg: number): Promise<number> {
-  const batch = await db.batches.get(batchId)
-  if (!batch) return 0
-  const actual = Math.max(0, Math.min(batch.remainKg, kg))
-  await db.batches.update(batchId, { remainKg: Math.round((batch.remainKg - actual) * 10) / 10, updatedAt: nowIso() })
-  return actual
+/** 月底对账结果 */
+export interface ReconcileResult {
+  /** 入账笔数（余量够扣、已扣减） */
+  postedCount: number
+  /** 入账合计（kg） */
+  postedKg: number
+  /** 退回笔数（轮到该笔时余量不足，留在技师账上等重交） */
+  rejectedCount: number
+  /** 对账后的批次余量（kg） */
+  remainKg: number
+}
+
+/**
+ * 月底对账：把该批次名下所有「待入账」的取料道次按取料先后逐笔扣余量。
+ * 轮到哪件不够就只退回那一件（标记「待重交」），前面已入账的照旧，后续各笔继续独立判断；
+ * 对账失败按侧恢复：技师这笔取料留着等重交，熔化工的余量不往回倒。
+ */
+export async function reconcileBatchDraws(batchId: string): Promise<ReconcileResult | null> {
+  return db.transaction('rw', [db.batches, db.pieces, db.steps], async () => {
+    const batch = await db.batches.get(batchId)
+    if (!batch) return null
+    const pieceIds = new Set(
+      (await db.pieces.where('batchId').equals(batchId).toArray()).map((row) => row.id),
+    )
+    const pending = (await db.steps.where('drawState').equals('待入账').toArray()).filter(
+      (row) => row.name === '取料' && row.drawKg > 0 && pieceIds.has(row.pieceId),
+    )
+    const ordered = sortDrawsByTime(
+      pending.map((row) => ({ step: row, at: row.createdAt, pieceId: row.pieceId, seq: row.seq })),
+    )
+
+    let remain = batch.remainKg
+    let postedCount = 0
+    let postedKg = 0
+    let rejectedCount = 0
+    const stamp = nowIso()
+    for (const { step } of ordered) {
+      if (remain >= step.drawKg) {
+        remain = round1(remain - step.drawKg)
+        postedCount += 1
+        postedKg = round1(postedKg + step.drawKg)
+        await db.steps.update(step.id, { drawState: '已入账' as DrawState, updatedAt: stamp })
+      } else {
+        rejectedCount += 1
+        await db.steps.update(step.id, { drawState: '待重交' as DrawState, updatedAt: stamp })
+      }
+    }
+    await db.batches.update(batchId, { remainKg: remain, updatedAt: stamp })
+    return { postedCount, postedKg, rejectedCount, remainKg: remain }
+  })
 }
 
 /* -------------------------------- 作品 -------------------------------- */
@@ -321,6 +390,26 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), furnaces, batches, pieces, steps, anneals, inspects }
 }
 
+/**
+ * 兼容旧版存档的工序行：缺取料量 / 入账状态时按迁移同款规则补历史默认，
+ * 避免导入 v2 及更早的 JSON 存档后出现缺字段的行。
+ */
+function normalizeStepRow(row: Step): Step {
+  const drawKg =
+    typeof row.drawKg === 'number' && !Number.isNaN(row.drawKg)
+      ? row.drawKg
+      : row.name === '取料'
+        ? parseDrawKgFromRemark(row.remark ?? '') ?? LEGACY_DRAW_KG
+        : 0
+  const drawState: DrawState =
+    row.drawState === '待入账' || row.drawState === '已入账' || row.drawState === '待重交'
+      ? row.drawState
+      : row.name === '取料' && row.state !== '已完成'
+        ? '待入账'
+        : '已入账'
+  return { ...row, drawKg, drawState, revision: ROW_REVISION }
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
     await Promise.all([
@@ -334,7 +423,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.furnaces.bulkPut(snapshot.furnaces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
+    await db.steps.bulkPut(snapshot.steps.map(normalizeStepRow))
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })

@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引，`v2 → v3` 为取料道次增加取料量与入账状态 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -75,7 +75,7 @@ sologsb101-1017/
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
         ├── router/index.ts     # 路由表 + ROUTES 常量
-        └── utils/              # thermal.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # thermal.ts ledger.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -84,9 +84,9 @@ sologsb101-1017/
 
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
-| `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
+| `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、**月底对账**按取料先后扣减批次余量、低于阈值高亮提示补料 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
-| `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
+| `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、**取料道次记取料量与入账状态（技师账）**、推进工序状态、前序未完成阻断进入退火排位 |
 | `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
@@ -100,13 +100,17 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**为「取料」道次增加 `drawKg`（取料量）与 `drawState`（入账状态）索引**，旧数据按归属迁移：
+    * 取料道次的 `drawKg` 优先从备注文本解析（如「取 G-101 料液约 6.2 kg」→ 6.2），解析不到补历史默认 5 kg；
+    * 技师那份补历史默认：历史已完成的取料视为 `已入账`，未完成的挂 `待入账` 等下次对账；
+    * 非取料道次 `drawKg` 补 0；导入旧版 JSON 存档时按同款规则补默认。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -114,7 +118,7 @@ sologsb101-1017/
   | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt |
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
-  | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
+  | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name, **drawState** |
   | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
   | `inspects` | id | pieceId, date, result, inspector |
 
@@ -123,6 +127,8 @@ sologsb101-1017/
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
+  * 取料道次带取料量与入账状态：G-101 被晨雾花器、赤霞杯**先后取用且均待入账**（对账时演示按取料先后扣余量），
+    A-207 有一笔待入账，C-330 / T-045 的取料为历史已入账；
   * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
@@ -164,4 +170,9 @@ npm run preview      # 预览 dist 产物
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
-* **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
+* **取料两本账（`src/utils/ledger.ts`）**：熔化工按料液批次记余量，技师按作品把取料量与操作人记到「取料」道次上；
+  余量仍归熔化工那本账，只在**月底对账**时扣减：
+  * 同一批次被多件作品取用时**按取料先后扣余量**，轮到哪件不够就**只退回这一件**（标记「待重交」），前面几件照旧，后续各笔继续独立判断；
+  * 对账失败后**按侧恢复**：技师这笔取料留在作品的取料道次上等修改后重交（保存即重新挂「待入账」），熔化工的余量**不往回倒**；
+  * 已入账的取料道次锁定取料量，不可再改；
+  * 剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
